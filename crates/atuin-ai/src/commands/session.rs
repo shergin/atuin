@@ -1108,15 +1108,16 @@ Content blocks, by `type`:
                   "moved_to","diff":"@@ -1,2 +1,3 @@\n..."}]}
 A block of any other type is kept as it is."#;
 
-/// How many bytes of lines one message of a push carries, well under the daemon's limit.
+/// About how many bytes of lines one message of a push carries: a line longer than this (a large
+/// tool result) is a message of its own.
 const PUSH_BATCH: usize = 1 << 20;
 
 /// `lines` in batches of about [`PUSH_BATCH`] bytes, each a message of a push.
 fn batches(lines: Vec<String>) -> Vec<Vec<String>> {
-    let mut batches = vec![Vec::new()];
+    let mut batches: Vec<Vec<String>> = vec![Vec::new()];
     let mut size = 0;
     for line in lines {
-        if size >= PUSH_BATCH {
+        if size > 0 && size + line.len() > PUSH_BATCH {
             batches.push(Vec::new());
             size = 0;
         }
@@ -1550,6 +1551,22 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+
+    /// A push's batches stay about [`PUSH_BATCH`] bytes, a line longer than that one of its own.
+    #[rstest]
+    fn lines_are_batched_by_size() {
+        let line = |n: usize| "x".repeat(n);
+        let sizes = |lines: Vec<String>| -> Vec<Vec<usize>> {
+            batches(lines).into_iter().map(|b| b.iter().map(String::len).collect()).collect()
+        };
+        let half = PUSH_BATCH / 2;
+        assert_eq!(sizes(vec![line(half), line(half), line(1)]), [vec![half, half], vec![1]]);
+        assert_eq!(sizes(vec![line(1), line(PUSH_BATCH * 3), line(1)]), [
+            vec![1],
+            vec![PUSH_BATCH * 3],
+            vec![1]
+        ]);
+    }
 
     fn handle(harness: HarnessKind, id: &str) -> HarnessSession {
         HarnessSession {
