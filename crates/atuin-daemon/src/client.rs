@@ -697,6 +697,36 @@ mod rebuild_tests {
         (AiClient::new(path).await.unwrap(), state, dir)
     }
 
+    /// A push whose later batch is bad still stores what the batches before it held, a line
+    /// waiting for a timed one included.
+    #[rstest]
+    #[tokio::test]
+    async fn a_bad_batch_keeps_the_batches_before_it() {
+        use atuin_client::ai_session::{HarnessKind, HarnessSession};
+        use futures::StreamExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.sock");
+        let (capture, _state) = AiHarnessSessionCapture::with_state(StoreState::Ready).await;
+        let capture = Arc::new(capture);
+        let service = AiSessionServer::new(AiSessionService::new(capture.clone()));
+        let incoming = UnixListenerStream::new(UnixListener::bind(&path).unwrap());
+        tokio::spawn(Server::builder().add_service(service).serve_with_incoming(incoming));
+        let mut client = AiClient::new(path).await.unwrap();
+
+        let handle = HarnessSession {
+            harness: HarnessKind::Amp,
+            session: "T-1".to_owned().into(),
+        };
+        let untimed = r#"{"v":1,"id":"m1","role":"user","content":[{"type":"text","text":"hi"}]}"#;
+        let batches = vec![vec![untimed.to_owned()], vec!["not a message".to_owned()]];
+        assert!(client.push_messages(handle.clone(), batches).await.is_err());
+
+        let stored: Vec<_> = capture.messages(&handle).map(Result::unwrap).collect().await;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].source_id.as_ref(), "m1");
+    }
+
     #[rstest]
     #[tokio::test]
     async fn waits_out_a_rebuild_over_the_wire() {

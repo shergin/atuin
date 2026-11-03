@@ -260,36 +260,51 @@ impl GrpcService for Service {
         };
         // Each batch is captured as it comes, so the daemon never holds a whole push, and read as
         // the next lines of the one push.
-        while let Some(PushMessagesRequest {
-            session,
-            lines: batch,
-        }) = batches.message().await?
-        {
-            let session = HarnessSession::try_from(session.ok_or(ParseError::Missing("session"))?)?;
-            let (handle, capture) = match &mut push {
-                Some((handle, capture)) => (handle, capture),
-                None => {
-                    let id = SessionId::from(String::from(session.session.clone()));
-                    let capture = self.capture.push(session.harness, &id).await.map_err(failed)?;
-                    let (handle, capture) = push.insert((session.clone(), capture));
-                    (handle, capture)
+        let streamed = async {
+            while let Some(PushMessagesRequest {
+                session,
+                lines: batch,
+            }) = batches.message().await?
+            {
+                let session =
+                    HarnessSession::try_from(session.ok_or(ParseError::Missing("session"))?)?;
+                let (handle, capture) = match &mut push {
+                    Some((handle, capture)) => (handle, capture),
+                    None => {
+                        let id = SessionId::from(String::from(session.session.clone()));
+                        let capture =
+                            self.capture.push(session.harness, &id).await.map_err(failed)?;
+                        let (handle, capture) = push.insert((session.clone(), capture));
+                        (handle, capture)
+                    }
+                };
+                if *handle != session {
+                    return Err(Status::invalid_argument(
+                        "every batch of a push names one session",
+                    ));
                 }
-            };
-            if *handle != session {
-                return Err(Status::invalid_argument("every batch of a push names one session"));
+                let mut lines = Vec::with_capacity(batch.len());
+                for line in batch {
+                    read += 1;
+                    lines.push(
+                        serde_json::from_str::<PushedMessage>(&line)
+                            .map_err(|e| Status::invalid_argument(format!("line {read}: {e}")))?,
+                    );
+                }
+                count(capture.lines(lines).await.map_err(failed)?);
             }
-            let mut lines = Vec::with_capacity(batch.len());
-            for line in batch {
-                read += 1;
-                lines.push(
-                    serde_json::from_str::<PushedMessage>(&line)
-                        .map_err(|e| Status::invalid_argument(format!("line {read}: {e}")))?,
-                );
-            }
-            count(capture.lines(lines).await.map_err(failed)?);
+            Ok::<_, Status>(())
         }
-        let (_, capture) = push.ok_or(ParseError::Missing("session"))?;
-        count(capture.finish().await.map_err(failed)?);
+        .await;
+        // However the push ended (a bad line, the client gone), what its earlier batches left
+        // waiting for a timed line is stored.
+        let Some((_, capture)) = push else {
+            streamed?;
+            return Err(ParseError::Missing("session").into());
+        };
+        let finished = capture.finish().await.map_err(failed);
+        streamed?;
+        count(finished?);
         Ok(Response::new(PushMessagesReply { pushed, duplicates }))
     }
 
