@@ -181,8 +181,9 @@ pub async fn boot(
     let journal = journal.with_octavo(octavo);
     let journal = Arc::new(journal);
     let history_service = HistoryServer::new(grpc::HistoryService::new(journal, handle.clone()));
-    let ai_session_service =
-        AiSessionServer::new(grpc::AiSessionService::new(ai_session_capture.clone()));
+    let ai_session_service = AiSessionServer::new(
+        grpc::AiSessionService::new(ai_session_capture.clone()).with_daemon(handle.clone()),
+    );
 
     // Start all components first (so gRPC services can work)
     daemon.start_components().await?;

@@ -271,7 +271,11 @@ impl Cmd {
 
 /// Write the key to the key file, re-encrypting the local store first if it was
 /// previously encrypted with a different key.
-async fn store_key(settings: &Settings, store: &SqliteStore, key: &paseto_v4::Key) -> Result<()> {
+pub async fn store_key(
+    settings: &Settings,
+    store: &SqliteStore,
+    key: &paseto_v4::Key,
+) -> Result<()> {
     let key_path = &settings.key_path;
 
     if !key_path.exists() {

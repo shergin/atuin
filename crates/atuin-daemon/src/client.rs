@@ -31,9 +31,9 @@ use crate::grpc::history::pb::{
     AuthorKind, CancelHistoryReply, CancelHistoryRequest, CommandCapture, CommandCaptureMeta,
     CompactStoreReply, CompactStoreRequest, DeleteHistoryReply, DeleteHistoryRequest,
     EndHistoryReply, EndHistoryRequest, GetCommandOutputRequest, GetCommandOutputResponse,
-    RebuildHistoryReply, RebuildHistoryRequest, RegisterCommandOutputRequest, ShutdownRequest,
-    StartHistoryReply, StartHistoryRequest, StatusReply, StatusRequest, TailHistoryReply,
-    TailHistoryRequest,
+    ImportHistoryRequest, RebuildHistoryReply, RebuildHistoryRequest, RegisterCommandOutputRequest,
+    ShutdownRequest, StartHistoryReply, StartHistoryRequest, StatusReply, StatusRequest,
+    TailHistoryReply, TailHistoryRequest,
 };
 use crate::grpc::request::ClientInterceptor;
 use crate::grpc::userio::pb::ListenLogsRequest;
@@ -197,6 +197,16 @@ impl HistoryClient {
 
     pub async fn compact_store(&mut self) -> Result<CompactStoreReply> {
         Ok(self.client.compact_store(CompactStoreRequest {}).await?.into_inner())
+    }
+
+    /// Have the daemon import `shell`'s history file after replying.
+    pub async fn import_history(&mut self, shell: &str, histfile: Option<String>) -> Result<()> {
+        let request = ImportHistoryRequest {
+            shell: shell.to_owned(),
+            histfile,
+        };
+        self.client.import_history(request).await?;
+        Ok(())
     }
 
     pub async fn status(&mut self) -> Result<StatusReply, tonic::Status> {
@@ -563,8 +573,19 @@ impl AiClient {
     ) -> Result<tonic::Streaming<ImportSessionsEvent>> {
         let request = ImportSessionsRequest {
             harness: harness.map(|h| h as i32),
+            background: false,
         };
         Ok(self.client.import_sessions(request).await?.into_inner())
+    }
+
+    /// Have the daemon import every harness's sessions after replying.
+    pub async fn import_sessions_in_background(&mut self) -> Result<()> {
+        let request = ImportSessionsRequest {
+            harness: None,
+            background: true,
+        };
+        self.client.import_sessions(request).await?;
+        Ok(())
     }
 }
 
