@@ -70,11 +70,11 @@ impl Cmd {
     #[instrument(level = "trace", skip_all, err)]
     pub async fn run(self, settings: &Settings, db: &Sqlite, store: &SqliteStore) -> Result<()> {
         let yes = self.yes || !io::stdout().is_terminal();
-        if yes && self.sync == Some(Sync::Cloud) {
-            eyre::bail!("signing in to Atuin Cloud needs you: run `atuin setup` without --yes");
-        }
         let found = Found::detect(settings, db).await;
         let plan = self.plan(&found, yes);
+        if yes && plan.sync == Sync::Cloud && found.syncing() != Some(Sync::Cloud) {
+            eyre::bail!("signing in to Atuin Cloud needs you: run `atuin setup` without --yes");
+        }
 
         if yes {
             let (tx, mut rx) = mpsc::unbounded_channel();
@@ -102,15 +102,21 @@ impl Cmd {
     /// `--yes` takes it as it is.
     fn plan(&self, found: &Found, yes: bool) -> Plan {
         let agents = THREADS && !found.agents.is_empty();
-        let sync = match (&self.sync, &found.server) {
+        let sync = match (&self.sync, found.syncing()) {
             (Some(sync), _) => sync.clone(),
-            (None, _) if yes => Sync::Off,
-            (None, Some(server)) => Sync::Server(server.clone()),
-            (None, None) => Sync::Cloud,
+            // Left as it is, rather than signing them out.
+            (None, Some(syncing)) => syncing,
+            (None, None) if yes || !cfg!(feature = "sync") => Sync::Off,
+            (None, None) => found.server.clone().map_or(Sync::Cloud, Sync::Server),
         };
         Plan {
             shell: !self.no_shell_history,
-            threads: agents && !self.no_threads,
+            // With no agents to ask about, as it is.
+            threads: if agents {
+                !self.no_threads
+            } else {
+                found.capture
+            },
             agent_history: agents && !self.no_agent_history,
             ctrl_r: found.ctrl_r && !self.no_ctrl_r,
             up_arrow: found.up_arrow && !self.no_up_arrow,
@@ -158,6 +164,8 @@ pub struct Found {
     /// Whether `atuin init` binds ctrl-r, and the up arrow, as configured now.
     ctrl_r: bool,
     up_arrow: bool,
+    /// Whether the daemon captures agent threads, as configured now.
+    capture: bool,
     signed_in: bool,
     /// A sync server that isn't Atuin Cloud, already configured.
     server: Option<String>,
@@ -175,6 +183,7 @@ impl Found {
             hooked,
             ctrl_r: settings.bind_ctrl_r,
             up_arrow: settings.bind_up_arrow,
+            capture: settings.threads.capture,
             signed_in: signed_in(settings).await,
             server: (!settings.is_hub_sync()).then(|| settings.sync_address.to_string()),
         }
@@ -186,6 +195,11 @@ impl Found {
 
     fn threads(&self) -> u64 {
         self.agents.iter().map(|&(_, threads)| threads).sum()
+    }
+
+    /// Where this machine syncs now, if it's signed in.
+    fn syncing(&self) -> Option<Sync> {
+        self.signed_in.then(|| self.server.clone().map_or(Sync::Cloud, Sync::Server))
     }
 }
 
@@ -290,16 +304,19 @@ async fn apply(
     let signed_in = match signed_in {
         // That restarts the daemon.
         SignedIn::NeedsKey(key) => {
-            if use_account_key(&settings, store, &key, tx).await {
+            let stored = use_account_key(&settings, store, &key, tx).await;
+            if stored {
                 sync_soon(&settings, tx).await;
+            } else {
+                sign_out().await;
             }
-            true
+            stored
         }
         SignedIn::Yes => {
             sync_soon(&settings, tx).await;
             true
         }
-        SignedIn::No => found.signed_in,
+        SignedIn::No => found.syncing().as_ref() == Some(&plan.sync),
     };
     let account = if signed_in {
         account(&settings, store).await
@@ -500,6 +517,16 @@ async fn use_account_key(_: &Settings, _: &SqliteStore, _: &paseto_v4::Key, _: &
     false
 }
 
+/// Forget the login, as `atuin logout` does.
+pub(super) async fn sign_out() {
+    if let Ok(settings) = Settings::new()
+        && let Ok(meta) = settings.meta_store().await
+    {
+        let _ = meta.delete_session().await;
+        let _ = meta.delete_hub_session().await;
+    }
+}
+
 /// Start the daemon, if it isn't running, to sync. One that is notices the sign-in itself.
 #[cfg(feature = "daemon")]
 async fn sync_soon(settings: &Settings, tx: &Updates) {
@@ -539,11 +566,16 @@ async fn write_config(plan: &Plan) -> Result<()> {
             changes.push(("bind_up_arrow", Value::from(plan.up_arrow)));
         }
     }
-    if plan.threads {
-        changes.push(("threads.capture", Value::from(true)));
+    if plan.threads != settings.threads.capture {
+        changes.push(("threads.capture", Value::from(plan.threads)));
     }
-    if let Sync::Server(address) = &plan.sync {
-        changes.push(("sync_address", Value::from(address.as_str())));
+    match &plan.sync {
+        Sync::Server(address) => changes.push(("sync_address", Value::from(address.as_str()))),
+        Sync::Cloud if !settings.is_hub_sync() => {
+            let cloud = atuin_client::settings::DEFAULT_SYNC_URL.as_str();
+            changes.push(("sync_address", Value::from(cloud)));
+        }
+        Sync::Cloud | Sync::Off => {}
     }
 
     let config_file = Settings::get_config_path()?;
@@ -621,14 +653,28 @@ async fn sync(
 ) -> SignedIn {
     use atuin_client::hub::{HubAuthSession, HubAuthStatus};
 
+    // A login for somewhere else would keep syncing there, or send its token to the new server.
+    let syncing = found.syncing();
+    if syncing.is_some() && syncing.as_ref() != Some(&plan.sync) {
+        sign_out().await;
+    }
     match &plan.sync {
+        Sync::Off if syncing.is_some() => {
+            let off = "Signed out: sync is off, and everything stays on this machine";
+            send(tx, Step::Sync, Status::Done(off.into()));
+            return SignedIn::No;
+        }
         Sync::Off => return SignedIn::No,
+        Sync::Server(address) if syncing.as_ref() == Some(&plan.sync) => {
+            send(tx, Step::Sync, Status::Done(format!("Syncing with {address}")));
+            return SignedIn::No;
+        }
         Sync::Server(address) => {
             let next = format!("Syncing with {address}: run `atuin login` to sign in");
             send(tx, Step::Sync, Status::Done(next));
             return SignedIn::No;
         }
-        Sync::Cloud if found.signed_in => return SignedIn::Yes,
+        Sync::Cloud if syncing == Some(Sync::Cloud) => return SignedIn::Yes,
         Sync::Cloud => {}
     }
 
@@ -686,10 +732,7 @@ async fn sync(
     let Ok(needs) = account_key(settings, store, tx, &mut answers).await else {
         // Signed in with a key that can't read the account's data is worse than not signed in:
         // sync would fail on every run.
-        if let Ok(meta) = settings.meta_store().await {
-            let _ = meta.delete_session().await;
-            let _ = meta.delete_hub_session().await;
-        }
+        sign_out().await;
         let later = "Sync is off until you have your key: run `atuin key` on a machine that \
                      syncs, then `atuin login` here";
         send(tx, Step::Sync, Status::Done(later.into()));
@@ -1173,6 +1216,7 @@ mod tests {
             hooked: false,
             ctrl_r: true,
             up_arrow: true,
+            capture: false,
             signed_in: false,
             server: None,
         }
@@ -1288,6 +1332,39 @@ mod tests {
     ) {
         found.server = server.map(Into::into);
         assert_eq!(Cmd::parse_from(["setup"]).plan(&found, yes).sync, expected);
+    }
+
+    #[rstest]
+    #[case::cloud(None, Sync::Cloud)]
+    #[case::their_server(Some("https://atuin.example.com"), Sync::Server("https://atuin.example.com".into()))]
+    fn sync_stays_where_it_is_signed_in(
+        mut found: Found,
+        #[values(false, true)] yes: bool,
+        #[case] server: Option<&str>,
+        #[case] expected: Sync,
+    ) {
+        found.signed_in = true;
+        found.server = server.map(Into::into);
+        assert_eq!(Cmd::parse_from(["setup"]).plan(&found, yes).sync, expected);
+    }
+
+    #[rstest]
+    #[case::found_and_kept(true, &[], true)]
+    #[case::found_and_turned_off(true, &["--no-threads"], false)]
+    #[case::none_found_and_left(false, &["--no-threads"], true)]
+    fn thread_capture(
+        mut found: Found,
+        #[case] agents: bool,
+        #[case] flags: &[&str],
+        #[case] expected: bool,
+    ) {
+        found.capture = true;
+        if !agents {
+            found.agents.clear();
+        }
+        let args = std::iter::once("setup").chain(flags.iter().copied());
+        // Without them, there are no agents to ask about.
+        assert_eq!(Cmd::parse_from(args).plan(&found, false).threads, expected || !THREADS);
     }
 
     #[rstest]

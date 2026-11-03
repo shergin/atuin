@@ -92,7 +92,17 @@ async fn drive(
                 let Some(key) = key? else { continue };
                 match running.handle(key) {
                     Handled::Answer(a) => { let _ = answer.send(a); }
-                    Handled::Abort => break None,
+                    Handled::Abort => {
+                        // A sign-in left half done would sync with a key that can't read the
+                        // account, and the next setup would take it as done.
+                        let signing_in = running.steps.iter().any(|(step, status)| {
+                            *step == Step::Sync && matches!(status, Status::Running(_))
+                        });
+                        if signing_in {
+                            super::sign_out().await;
+                        }
+                        break None;
+                    }
                     Handled::Nothing => {}
                 }
             }
@@ -357,7 +367,7 @@ impl Choose {
                 }
                 Row::Sync => {
                     let about = match self.sync {
-                        0 if found.signed_in => "signed in",
+                        0 if found.syncing() == Some(Sync::Cloud) => "signed in",
                         0 => "encrypted, on all your machines",
                         1 => "",
                         _ => "keep everything on this machine",
@@ -745,6 +755,7 @@ mod tests {
             hooked: false,
             ctrl_r: true,
             up_arrow: true,
+            capture: false,
             signed_in: false,
             server: None,
         }

@@ -167,9 +167,11 @@ impl GrpcService for Service {
             // The importers are the CLI's.
             let mut command = tokio::process::Command::new(&exe);
             command.args(["import", shell.as_str()]).stdin(Stdio::null()).stdout(Stdio::null());
-            if let Some(histfile) = &histfile {
-                command.env("HISTFILE", histfile);
-            }
+            // Not the daemon's own, which may be another shell's.
+            match &histfile {
+                Some(histfile) => command.env("HISTFILE", histfile),
+                None => command.env_remove("HISTFILE"),
+            };
             match command.output().await {
                 Ok(output) if output.status.success() => {}
                 Ok(output) => {

@@ -520,19 +520,25 @@ pub struct Recent {
 pub async fn recent(settings: &Settings, n: usize) -> Result<Vec<Recent>> {
     let mut client = AiClient::from_settings(settings).await?;
     client.wait_for_sessions(|_| {}).await?;
-    let sessions = crate::tools::session::list_sessions(&mut client, None, None)
-        .await
-        .map_err(|e| eyre!(e))?;
-    Ok(sessions
-        .iter()
-        .filter(|s| s.parent.is_none())
+    let filter = SessionFilter {
+        roots_only: true,
+        ..SessionFilter::default()
+    };
+    // Newest first, so only as many as are shown.
+    client
+        .list_sessions(&filter)
+        .await?
         .take(n)
-        .map(|s| Recent {
-            harness: s.handle.harness,
-            age: age(s.updated_at),
-            title: one_line(title_of(s), 200),
+        .map(|s| {
+            let s = Session::try_from(s?)?;
+            Ok(Recent {
+                harness: s.handle.harness,
+                age: age(s.updated_at),
+                title: one_line(title_of(&s), 200),
+            })
         })
-        .collect())
+        .try_collect()
+        .await
 }
 
 async fn import(
