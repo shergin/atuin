@@ -191,10 +191,9 @@ mod tests {
         assert_eq!(read[0].parent, None);
         assert!(read.windows(2).all(|w| w[1].parent == w[0].id), "each follows the one before");
         assert_eq!(read[0].role(), Role::User);
-        assert_eq!(
-            read[0].cwd.as_deref(),
-            Some(std::path::Path::new("/home/ellie/.cache/amp-e2e/proj"))
-        );
+        // The workspace's file URI, as a path on this platform.
+        let tree = url::Url::parse("file:///home/ellie/.cache/amp-e2e/proj").unwrap();
+        assert_eq!(read[0].cwd, tree.to_file_path().ok());
 
         let call = &read[1];
         assert_eq!(call.model.as_deref(), Some("gpt-6.1-sol"));
