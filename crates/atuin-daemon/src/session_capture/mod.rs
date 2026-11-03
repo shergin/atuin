@@ -22,13 +22,15 @@ use atuin_client::ai_session::{
 use atuin_client::record::decode::map_parallel;
 use atuin_client::record::sqlite_store::SqliteStore;
 use atuin_common::encryption::paseto_v4::Key;
-use atuin_common::harnesstools::session::{Content, Role, ToolCallId};
+use atuin_common::harnesstools::session::pushed::PushedMessage;
+use atuin_common::harnesstools::session::{AnyMessage, Content, Role, SessionId, ToolCallId};
 use atuin_common::sync::BlockingPool;
 use atuin_domain::record::HostId;
 use engine::SessionCaptureEngine;
 use futures::{FutureExt, Stream, StreamExt};
 pub use import::ImportProgress;
 use import::SessionImporter;
+use message_enricher::MessageEnricher;
 pub use policy::CapturePolicy;
 use policy::Verdict;
 use recovery::{Backoff, Coordinator, Msg};
@@ -1118,6 +1120,38 @@ impl AiHarnessSessionCapture {
             .wait_for(|state| *state != StoreState::Recovering)
             .await
             .is_ok_and(|state| *state == StoreState::Ready)
+    }
+
+    /// Capture `lines` an agent handed over for `session` (`atuin threads push`), as a transcript's
+    /// lines are captured: rows already stored are duplicates, so a line pushed again is skipped.
+    /// Returns what became of each row.
+    pub async fn push(
+        &self,
+        harness: HarnessKind,
+        session: &SessionId,
+        lines: Vec<PushedMessage>,
+    ) -> Result<Vec<Appended>, AppendError> {
+        let sink = &self.sink;
+        let mut enricher = MessageEnricher::new(harness).keeping_patches(sink.keeps_patches());
+        let handle = enricher.handle(session);
+        let warmed =
+            engine::read_warm(sink, &handle, sink.lock_ready().await?).await.map_err(|err| {
+                match err {
+                    engine::WarmError::Repair(err) => err,
+                    engine::WarmError::Read(err) => AppendError::Sidecar(err),
+                    #[cfg(test)]
+                    engine::WarmError::Injected => AppendError::Aborted,
+                }
+            })?;
+        // Without the content-addressed ids stored: a line without an id pushed again is the
+        // same line, not the next one like it.
+        enricher.resume(session, warmed.row.as_ref(), &warmed.titles, warmed.last.as_ref(), &[]);
+        let mut rows = Vec::new();
+        for line in lines {
+            rows.extend(enricher.capture(session, &AnyMessage::Pushed(line)));
+        }
+        rows.extend(enricher.finish(session));
+        sink.append_all(rows).await
     }
 
     pub fn import(
@@ -4371,5 +4405,47 @@ mod pipeline_tests {
             continued.iter().flat_map(|m| enricher.capture(&sid(id), m)).collect();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].parent_source_id, Some(last));
+    }
+
+    /// A thread pushed again stores each row once, a line without an id
+    /// included, and keeps the title an earlier push gave it.
+    #[rstest]
+    #[tokio::test]
+    async fn pushing_a_thread_again_stores_only_what_is_new() {
+        let (capture, _state) = AiHarnessSessionCapture::with_state(StoreState::Ready).await;
+        let line = |raw: serde_json::Value| serde_json::from_value::<PushedMessage>(raw).unwrap();
+        let first = vec![
+            line(serde_json::json!({
+                "v": 1, "id": "m1", "role": "user", "time": "2026-10-16T10:00:00Z",
+                "title": {"text": "fix the tests", "source": "named"},
+                "content": [{"type": "text", "text": "fix the tests"}]
+            })),
+            line(serde_json::json!({
+                "v": 1, "role": "system", "time": "2026-10-16T10:00:01Z",
+                "content": [{"type": "text", "text": "no id"}]
+            })),
+        ];
+        let mut second = first.clone();
+        second.push(line(serde_json::json!({
+            "v": 1, "id": "m2", "parent": "m1", "role": "assistant", "time": "2026-10-16T10:00:02Z",
+            "content": [{"type": "text", "text": "done"}]
+        })));
+        let session = SessionId::from("T-1".to_owned());
+        let push = |lines| capture.push(HarnessKind::Pi, &session, lines);
+
+        assert_eq!(push(first).await.unwrap(), vec![Appended::New; 2]);
+        assert_eq!(push(second).await.unwrap(), vec![
+            Appended::Duplicate,
+            Appended::Duplicate,
+            Appended::New
+        ]);
+        let handle = HarnessSession {
+            harness: HarnessKind::Pi,
+            session: "T-1".to_owned().into(),
+        };
+        let messages: Vec<_> = capture.messages(&handle).map(Result::unwrap).collect().await;
+        assert_eq!(messages.len(), 3);
+        let row = capture.get_session(&handle).await.unwrap().unwrap();
+        assert_eq!(row.title.as_deref(), Some("fix the tests"));
     }
 }

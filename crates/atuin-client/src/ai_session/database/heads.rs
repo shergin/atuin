@@ -95,7 +95,7 @@ pub struct Analysis {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Model {
     /// By parent pointers. `chained`: a row with no parent follows on from the row before it
-    /// (Codex and Grok, whose capture links rows; Copilot's rows from before its reader did); otherwise
+    /// (Codex, Grok and Amp, whose capture links rows; Copilot's rows from before its reader did); otherwise
     /// it is a root. `beside`: content-addressed rows are no node (titles, lines with no id);
     /// otherwise they are nodes like any other (Codex, Grok).
     Tree {
@@ -117,7 +117,7 @@ impl Model {
                 chained: true,
                 beside: true,
             },
-            HarnessKind::Codex | HarnessKind::Grok => Self::Tree {
+            HarnessKind::Codex | HarnessKind::Grok | HarnessKind::Amp => Self::Tree {
                 chained: true,
                 beside: false,
             },

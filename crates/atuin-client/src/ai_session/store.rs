@@ -133,20 +133,34 @@ impl AiSessionRecord {
     /// (named msgpack, without [`Message::atuin_id`]) is no longer read.
     pub const VERSION: RecordVersion = RecordVersion::V2;
 
-    /// The version this record is written as: [`Self::VERSION`], `v3` for a message naming `omp`
-    /// or carrying [`Message::provider`], or `v4` for a message naming `grok` (all sharing the
-    /// same compressed msgpack body). Older readers skip records of a known version they can't
-    /// decode for good, whereas a version they don't know yet they hold until upgraded.
+    /// The version this record is written as: [`Self::VERSION`], or v3 (the same body) for a
+    /// message naming a harness v2 readers don't know (omp), or with a field they don't
+    /// ([`Message::provider`]), or v4 for one naming a harness v3 readers don't know (Grok, Amp,
+    /// and any added since). Those can't decode it, and skip what they can't decode for good; a
+    /// version they don't know they hold until they're upgraded. v4 readers read a harness they
+    /// don't know as [`HarnessKind::Unknown`], so later harnesses need no version of their own.
     #[must_use]
     pub fn version(&self) -> RecordVersion {
         match self {
             Self::Message(msg) => {
-                let harnesses = [Some(msg.session.harness), msg.parent.as_ref().map(|p| p.harness)];
-                if harnesses.into_iter().flatten().any(|h| h == HarnessKind::Grok) {
+                let harnesses: Vec<_> = std::iter::once(msg.session.harness)
+                    .chain(msg.parent.as_ref().map(|p| p.harness))
+                    .collect();
+                let v3_knows = |h: &HarnessKind| {
+                    matches!(
+                        h,
+                        HarnessKind::Unknown
+                            | HarnessKind::ClaudeCode
+                            | HarnessKind::Codex
+                            | HarnessKind::Copilot
+                            | HarnessKind::Opencode
+                            | HarnessKind::Pi
+                            | HarnessKind::Omp
+                    )
+                };
+                if !harnesses.iter().all(v3_knows) {
                     RecordVersion::V4
-                } else if harnesses.into_iter().flatten().any(|h| h == HarnessKind::Omp)
-                    || msg.provider.is_some()
-                {
+                } else if harnesses.contains(&HarnessKind::Omp) || msg.provider.is_some() {
                     RecordVersion::V3
                 } else {
                     Self::VERSION

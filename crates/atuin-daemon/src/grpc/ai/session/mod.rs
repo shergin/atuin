@@ -3,26 +3,30 @@ pub mod pb;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use atuin_client::ai_session::{SearchTerms, SessionFilter};
+use atuin_client::ai_session::{Appended, HarnessSession, SearchTerms, SessionFilter};
+use atuin_common::harnesstools::session::SessionId;
+use atuin_common::harnesstools::session::pushed::PushedMessage;
 use futures::StreamExt;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tonic::metadata::MetadataValue;
-use tonic::{Code, Request, Response, Status};
+use tonic::{Code, Request, Response, Status, Streaming};
 
 use crate::grpc::ai::agent::pb as agent;
+use crate::grpc::ai::agent::pb::ParseError;
 use crate::grpc::ai::session::pb::ai_session_server::AiSession as GrpcService;
 use crate::grpc::ai::session::pb::{
     GetSessionEvent, GetSessionRequest, HarnessFilterRequest, ImportSessionsEvent,
     ImportSessionsProgress, ImportSessionsRequest, ImportSessionsSummary, ListSessionsRequest,
-    ProjectSyncedReply, ProjectSyncedRequest, RebuildSessionsReply, RebuildSessionsRequest,
-    SearchSessionsMatch, SearchSessionsRequest, SessionRefRequest, TailSessionsEvent,
-    TailSessionsRequest, get_session_event, import_sessions_event, tail_sessions_event,
+    ProjectSyncedReply, ProjectSyncedRequest, PushMessagesReply, PushMessagesRequest,
+    RebuildSessionsReply, RebuildSessionsRequest, SearchSessionsMatch, SearchSessionsRequest,
+    SessionRefRequest, TailSessionsEvent, TailSessionsRequest, get_session_event,
+    import_sessions_event, tail_sessions_event,
 };
 use crate::grpc::common::pb as common;
 use crate::grpc::common::pb::Lagged;
 use crate::session_capture::{
-    AiHarnessSessionCapture, ImportProgress, RebuildError, SessionTailEvent,
+    AiHarnessSessionCapture, AppendError, ImportProgress, RebuildError, SessionTailEvent,
 };
 
 #[derive(Clone)]
@@ -237,6 +241,44 @@ impl GrpcService for Service {
     ) -> Result<Response<ProjectSyncedReply>, Status> {
         self.capture.project_synced().await;
         Ok(Response::new(ProjectSyncedReply {}))
+    }
+
+    async fn push_messages(
+        &self,
+        request: Request<Streaming<PushMessagesRequest>>,
+    ) -> Result<Response<PushMessagesReply>, Status> {
+        self.ensure_recovered()?;
+        let mut batches = request.into_inner();
+        let (mut handle, mut lines) = (None, Vec::new());
+        while let Some(PushMessagesRequest {
+            session,
+            lines: batch,
+        }) = batches.message().await?
+        {
+            let session = HarnessSession::try_from(session.ok_or(ParseError::Missing("session"))?)?;
+            if handle.get_or_insert_with(|| session.clone()) != &session {
+                return Err(Status::invalid_argument("every batch of a push names one session"));
+            }
+            for line in batch {
+                let n = lines.len() + 1;
+                lines.push(
+                    serde_json::from_str::<PushedMessage>(&line)
+                        .map_err(|e| Status::invalid_argument(format!("line {n}: {e}")))?,
+                );
+            }
+        }
+        let handle = handle.ok_or(ParseError::Missing("session"))?;
+        let session = SessionId::from(String::from(handle.session));
+        let appended =
+            self.capture.push(handle.harness, &session, lines).await.map_err(|e| match e {
+                AppendError::Unavailable => Status::failed_precondition(e.to_string()),
+                e => Status::internal(e.to_string()),
+            })?;
+        let pushed = appended.iter().filter(|a| **a == Appended::New).count() as u64;
+        Ok(Response::new(PushMessagesReply {
+            pushed,
+            duplicates: appended.len() as u64 - pushed,
+        }))
     }
 
     async fn import_sessions(

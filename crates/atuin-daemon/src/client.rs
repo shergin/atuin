@@ -19,12 +19,13 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 use tracing::{Level, instrument, span, warn};
 
-use crate::grpc::ai::agent::pb::Session as AiSession;
+use crate::grpc::ai::agent::pb::{HarnessSession as AgentHarnessSession, Session as AiSession};
 use crate::grpc::ai::session::pb::ai_session_client::AiSessionClient as AiSessionServiceClient;
 use crate::grpc::ai::session::pb::{
     GetSessionEvent, GetSessionRequest, ImportSessionsEvent, ImportSessionsRequest,
-    ListSessionsRequest, ProjectSyncedRequest, RebuildSessionsRequest, SearchSessionsMatch,
-    SearchSessionsRequest, TailSessionsEvent, TailSessionsRequest,
+    ListSessionsRequest, ProjectSyncedRequest, PushMessagesReply, PushMessagesRequest,
+    RebuildSessionsRequest, SearchSessionsMatch, SearchSessionsRequest, TailSessionsEvent,
+    TailSessionsRequest,
 };
 use crate::grpc::history::pb::history_client::HistoryClient as HistoryServiceClient;
 use crate::grpc::history::pb::{
@@ -555,6 +556,21 @@ impl AiClient {
     pub async fn project_synced(&mut self) -> Result<()> {
         self.client.project_synced(ProjectSyncedRequest {}).await?;
         Ok(())
+    }
+
+    /// Hand the daemon messages of `session`, each a line of `atuin threads push` input, to
+    /// capture: one push, sent a batch at a time.
+    pub async fn push_messages(
+        &mut self,
+        session: HarnessSession,
+        batches: Vec<Vec<String>>,
+    ) -> Result<PushMessagesReply> {
+        let session = AgentHarnessSession::from(session);
+        let requests = batches.into_iter().map(move |lines| PushMessagesRequest {
+            session: Some(session.clone()),
+            lines,
+        });
+        Ok(self.client.push_messages(futures::stream::iter(requests)).await?.into_inner())
     }
 
     pub async fn import_sessions(
