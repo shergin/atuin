@@ -54,7 +54,7 @@ pub async fn export(id: &str) -> Result<Vec<PushedMessage>, ExportError> {
     Ok(messages(&amp(&["threads", "export", id]).await?))
 }
 
-/// The messages of an exported `thread`, each following the one before it.
+/// The messages of an exported `thread`, each following the one before it, then its title.
 fn messages(thread: &Value) -> Vec<PushedMessage> {
     let cwd = thread["env"]["initial"]["trees"][0]["uri"]
         .as_str()
@@ -96,22 +96,47 @@ fn messages(thread: &Value) -> Vec<PushedMessage> {
                 reasoning: None,
             }),
             stop: stop(&m["state"]),
-            // On the newest message, so an import after a rename says so.
-            title: (n + 1 == raw.len()).then_some(title).flatten().map(|text| Title {
-                text: Some(text.to_owned()),
-                source: Source::Generated,
-            }),
+            title: None,
             parent_session: None,
             parent_kind: None,
             id: Some(id),
         });
     }
+    // A row of its own, without an id, so it is keyed on the title and when the thread last
+    // changed: a message the plugin already stored would carry it as a duplicate, and drop it.
+    if let Some(text) = title {
+        let time = parsed(&thread["updatedAt"]).or_else(|| out.last().and_then(|m| m.time));
+        out.push(PushedMessage {
+            role: "system".to_owned(),
+            time,
+            title: Some(Title {
+                text: Some(text.to_owned()),
+                source: Source::Generated,
+            }),
+            v: Version,
+            id: None,
+            parent: None,
+            content: Vec::new(),
+            cwd: None,
+            branch: None,
+            model: None,
+            provider: None,
+            turn: None,
+            usage: None,
+            stop: None,
+            parent_session: None,
+            parent_kind: None,
+        });
+    }
     out
+}
+
+fn parsed(v: &Value) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(v.as_str()?, &Rfc3339).ok()
 }
 
 /// When `m` was written: its `createdAt`, else its model call's time, else when it was sent.
 fn time(m: &Value) -> Option<OffsetDateTime> {
-    let parsed = |v: &Value| OffsetDateTime::parse(v.as_str()?, &Rfc3339).ok();
     parsed(&m["createdAt"]).or_else(|| parsed(&m["usage"]["timestamp"])).or_else(|| {
         let ms = m["meta"]["sentAt"].as_i64()?;
         OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok()
@@ -186,6 +211,7 @@ mod tests {
     #[rstest]
     fn reads_an_exported_thread() {
         let read = messages(&thread());
+        let (title, read) = read.split_last().unwrap();
         assert_eq!(read.len(), 14);
         assert_eq!(read[0].id.as_deref(), Some("M-034qq9yNic5tdSISmJcXx8"));
         assert_eq!(read[0].parent, None);
@@ -209,12 +235,11 @@ mod tests {
             .count();
         assert_eq!(errors, 1);
 
-        let last = read.last().unwrap();
-        assert_eq!(
-            last.title.as_ref().and_then(|t| t.text.as_deref()),
-            Some("calc.py addition fix")
-        );
-        assert!(read[..13].iter().all(|m| m.title.is_none()));
+        // The title is a row of its own: on a message the plugin stored, it would be dropped.
+        let text = title.title.as_ref().and_then(|t| t.text.as_deref());
+        assert_eq!(text, Some("calc.py addition fix"));
+        assert_eq!((title.id.as_deref(), title.parent.as_deref()), (None, None));
+        assert!(read.iter().all(|m| m.title.is_none()));
     }
 
     /// Older threads' messages have no `protocolMessageID`, and the oldest no id at all: each is
