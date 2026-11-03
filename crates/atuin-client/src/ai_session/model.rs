@@ -665,7 +665,8 @@ mod tests {
     }
 
     /// A message v2 readers can't decode (naming omp, or with a provider) is written as v3, one v3
-    /// readers can't (naming Amp) as v4, and each reads back.
+    /// readers can't (naming Grok) as v4, one v4 readers can't (naming Amp) as v5, and each reads
+    /// back.
     #[rstest]
     #[case::pi(HarnessKind::Pi, None, None, RecordVersion::V2)]
     #[case::omp(HarnessKind::Omp, None, None, RecordVersion::V3)]
@@ -673,8 +674,14 @@ mod tests {
     #[case::with_a_provider(HarnessKind::Omp, None, Some("openai-codex"), RecordVersion::V3)]
     #[case::grok(HarnessKind::Grok, None, None, RecordVersion::V4)]
     #[case::continued_from_grok(HarnessKind::Pi, Some(HarnessKind::Grok), None, RecordVersion::V4)]
-    #[case::amp(HarnessKind::Amp, None, None, RecordVersion::V4)]
-    #[case::continued_from_amp(HarnessKind::Pi, Some(HarnessKind::Amp), None, RecordVersion::V4)]
+    #[case::amp(HarnessKind::Amp, None, None, RecordVersion::V5)]
+    #[case::continued_from_amp(HarnessKind::Pi, Some(HarnessKind::Amp), None, RecordVersion::V5)]
+    #[case::grok_continued_from_amp(
+        HarnessKind::Grok,
+        Some(HarnessKind::Amp),
+        None,
+        RecordVersion::V5
+    )]
     fn newer_harnesses_have_newer_versions(
         #[case] harness: HarnessKind,
         #[case] parent: Option<HarnessKind>,
@@ -715,7 +722,7 @@ mod tests {
     #[rstest]
     fn an_unknown_version_is_refused() {
         let record = AiSessionRecord::Message(record_message()).serialize();
-        let version = RecordVersion::Other("v5".to_owned());
+        let version = RecordVersion::Other("v6".to_owned());
         let err = AiSessionRecord::deserialize(&record, &version).unwrap_err();
         assert!(matches!(err, DecodeError::UnknownVersion(v) if v == version));
     }
