@@ -249,7 +249,8 @@ impl GrpcService for Service {
     ) -> Result<Response<PushMessagesReply>, Status> {
         self.ensure_recovered()?;
         let mut batches = request.into_inner();
-        let (mut handle, mut lines) = (None, Vec::new());
+        let (mut handle, mut read, mut pushed, mut duplicates) = (None, 0, 0, 0);
+        // Each batch is captured as it comes, so the daemon never holds a whole push.
         while let Some(PushMessagesRequest {
             session,
             lines: batch,
@@ -259,26 +260,25 @@ impl GrpcService for Service {
             if handle.get_or_insert_with(|| session.clone()) != &session {
                 return Err(Status::invalid_argument("every batch of a push names one session"));
             }
+            let mut lines = Vec::with_capacity(batch.len());
             for line in batch {
-                let n = lines.len() + 1;
+                read += 1;
                 lines.push(
                     serde_json::from_str::<PushedMessage>(&line)
-                        .map_err(|e| Status::invalid_argument(format!("line {n}: {e}")))?,
+                        .map_err(|e| Status::invalid_argument(format!("line {read}: {e}")))?,
                 );
             }
+            let id = SessionId::from(String::from(session.session));
+            let appended =
+                self.capture.push(session.harness, &id, lines).await.map_err(|e| match e {
+                    AppendError::Unavailable => Status::failed_precondition(e.to_string()),
+                    e => Status::internal(e.to_string()),
+                })?;
+            let new = appended.iter().filter(|a| **a == Appended::New).count() as u64;
+            (pushed, duplicates) = (pushed + new, duplicates + appended.len() as u64 - new);
         }
-        let handle = handle.ok_or(ParseError::Missing("session"))?;
-        let session = SessionId::from(String::from(handle.session));
-        let appended =
-            self.capture.push(handle.harness, &session, lines).await.map_err(|e| match e {
-                AppendError::Unavailable => Status::failed_precondition(e.to_string()),
-                e => Status::internal(e.to_string()),
-            })?;
-        let pushed = appended.iter().filter(|a| **a == Appended::New).count() as u64;
-        Ok(Response::new(PushMessagesReply {
-            pushed,
-            duplicates: appended.len() as u64 - pushed,
-        }))
+        handle.ok_or(ParseError::Missing("session"))?;
+        Ok(Response::new(PushMessagesReply { pushed, duplicates }))
     }
 
     async fn import_sessions(
