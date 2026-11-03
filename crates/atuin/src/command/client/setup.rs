@@ -1331,6 +1331,12 @@ mod tests {
         #[case] expected: Sync,
     ) {
         found.server = server.map(Into::into);
+        // Without sync, there's nowhere to sync to.
+        let expected = if cfg!(feature = "sync") {
+            expected
+        } else {
+            Sync::Off
+        };
         assert_eq!(Cmd::parse_from(["setup"]).plan(&found, yes).sync, expected);
     }
 
