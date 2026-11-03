@@ -53,6 +53,9 @@ function block(b: Block): Block {
 	}
 }
 
+// How long a push may take: a turn it misses is left out of Threads, not held up.
+const PUSH_TIMEOUT_MS = 10_000;
+
 const STOP: Record<string, string> = { end_turn: "end_turn", tool_use: "tool_use", cancelled: "aborted" };
 
 export default function (amp: PluginAPI) {
@@ -90,8 +93,16 @@ export default function (amp: PluginAPI) {
 				stdio: ["pipe", "ignore", "ignore"],
 			});
 			const done = new Promise((resolve) => {
-				push.on("close", resolve);
-				push.on("error", resolve);
+				const timer = setTimeout(() => {
+					push.kill();
+					resolve(undefined);
+				}, PUSH_TIMEOUT_MS);
+				const settle = () => {
+					clearTimeout(timer);
+					resolve(undefined);
+				};
+				push.on("close", settle);
+				push.on("error", settle);
 			});
 			push.stdin.on("error", () => {});
 			push.stdin.end(lines.join(""));
