@@ -249,15 +249,33 @@ impl GrpcService for Service {
     ) -> Result<Response<PushMessagesReply>, Status> {
         self.ensure_recovered()?;
         let mut batches = request.into_inner();
-        let (mut handle, mut read, mut pushed, mut duplicates) = (None, 0, 0, 0);
-        // Each batch is captured as it comes, so the daemon never holds a whole push.
+        let (mut push, mut read, mut pushed, mut duplicates) = (None, 0, 0, 0);
+        let failed = |e: AppendError| match e {
+            AppendError::Unavailable => Status::failed_precondition(e.to_string()),
+            e => Status::internal(e.to_string()),
+        };
+        let mut count = |appended: Vec<Appended>| {
+            let new = appended.iter().filter(|a| **a == Appended::New).count() as u64;
+            (pushed, duplicates) = (pushed + new, duplicates + appended.len() as u64 - new);
+        };
+        // Each batch is captured as it comes, so the daemon never holds a whole push, and read as
+        // the next lines of the one push.
         while let Some(PushMessagesRequest {
             session,
             lines: batch,
         }) = batches.message().await?
         {
             let session = HarnessSession::try_from(session.ok_or(ParseError::Missing("session"))?)?;
-            if handle.get_or_insert_with(|| session.clone()) != &session {
+            let (handle, capture) = match &mut push {
+                Some((handle, capture)) => (handle, capture),
+                None => {
+                    let id = SessionId::from(String::from(session.session.clone()));
+                    let capture = self.capture.push(session.harness, &id).await.map_err(failed)?;
+                    let (handle, capture) = push.insert((session.clone(), capture));
+                    (handle, capture)
+                }
+            };
+            if *handle != session {
                 return Err(Status::invalid_argument("every batch of a push names one session"));
             }
             let mut lines = Vec::with_capacity(batch.len());
@@ -268,16 +286,10 @@ impl GrpcService for Service {
                         .map_err(|e| Status::invalid_argument(format!("line {read}: {e}")))?,
                 );
             }
-            let id = SessionId::from(String::from(session.session));
-            let appended =
-                self.capture.push(session.harness, &id, lines).await.map_err(|e| match e {
-                    AppendError::Unavailable => Status::failed_precondition(e.to_string()),
-                    e => Status::internal(e.to_string()),
-                })?;
-            let new = appended.iter().filter(|a| **a == Appended::New).count() as u64;
-            (pushed, duplicates) = (pushed + new, duplicates + appended.len() as u64 - new);
+            count(capture.lines(lines).await.map_err(failed)?);
         }
-        handle.ok_or(ParseError::Missing("session"))?;
+        let (_, capture) = push.ok_or(ParseError::Missing("session"))?;
+        count(capture.finish().await.map_err(failed)?);
         Ok(Response::new(PushMessagesReply { pushed, duplicates }))
     }
 
